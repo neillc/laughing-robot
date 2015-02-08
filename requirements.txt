@@ -1,3 +1,3 @@
 requests
 semantic_version
-github3
+github3.py
