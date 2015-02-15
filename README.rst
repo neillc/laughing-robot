@@ -41,6 +41,15 @@ Things I Learned About Bower
 2. bower "packages" don't even need to supply a bower.json
 
 
+Current Status
+--------------
+
+Reworking in progress to add a caching mode and to use pythongit instead
+of the github api.
+
+Lots of dust and mess at the moment.
+
+Very much WIP
 
 ------------
 

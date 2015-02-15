@@ -1,3 +1,8 @@
 bower.py.egg-info
 build
 dist
+bip.json
+bower.json
+bower.json.bak
+bower_components/
+

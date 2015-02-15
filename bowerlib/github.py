@@ -25,7 +25,7 @@ class GitHubRepos:
         tags = []
         log.info('looking for tags of {}/{}'.format(self.owner, self.project))
         repos = github3.GitHub().repository(self.owner, self.project)
-        for tag in repos.iter_tags():
+        for tag in repos.tags():
             version_tag = tag.name
             # so far all tags appear to prepend "v" to version
             if version_tag[0] == 'v':

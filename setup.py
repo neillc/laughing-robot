@@ -24,7 +24,7 @@ setup(
         'Programming Language :: Python :: 3.4',
     ],
     keywords='bower javascript',
-    install_requires=['requests', 'semantic_version', 'github3.py'],
+    install_requires=['requests', 'semantic_version', 'gitpython'],
     packages=['bowerlib'],
     entry_points={
         'console_scripts': [
