@@ -3,31 +3,31 @@
 Bower Registry API_URL
 https://docs.google.com/document/d/17Nzv7onwsFYQU2ompvzNI9cCBczVHntWMiAn4zDip1w
 
-Two modes of operation - one to populate the cache, the other to install 
+Two modes of operation - one to populate the cache, the other to install
 packages.
 
 Populate Cache:
-   Given a list of package specifications either on the command line or in 
+   Given a list of package specifications either on the command line or in
    bower.json.
-   
+
    Query bower to find the location of the packages git repo
-   
+
    Clone the repo into the cache if it's not already there.
-   
+
    If it is do a git pull to update?
-   
+
    Extract a zip archive of the specified version into the cache
-   
+
 Install a package:
    Use the cache if available
-   
+
    If the package is not in the cache try and add it to the cache
-   
-   If there is no cache clone the repo to /tmp/bower.py and extract the zip 
+
+   If there is no cache clone the repo to /tmp/bower.py and extract the zip
    file
-   
+
    Extract the contents of the zip file to <PROJECT_DIR>/bower_templates
-   
+
 Use argparse as much as possible for command line shenannigans.
 Use pythongit rather than the github api
 Options to be more or less verbose
@@ -51,14 +51,45 @@ import logging
 import git
 from git.util import RemoteProgress
 import requests
+from semantic_version import Spec, Version
 
 from bowerlib.github import GitHubRepos
 
 log = logging.getLogger(__name__)
 
+BUILD_RE = re.compile(r'^v{0,1}([\d\.]+)-{1}(build)(.*)$')
+PRERELEASE_RE = re.compile(r'^v{0,1}([\d\.]+)-{,1}(a|b|rc)(.*)$')
 
 # http://stackoverflow.com/questions/19069093/what-is-the-official-bower-registry-url
 API_URL = "https://bower.herokuapp.com"
+
+def get_version_from_tag(tag_name):
+    match = BUILD_RE.match(tag_name)
+    if match:
+        version = '{version}+build{build_info}'.format(
+            version=match.group(1),
+            build_info = match.group(2)
+            )
+    else:
+        match = PRERELEASE_RE.match(tag_name)
+        if match:
+            version = '{version}-{prerelease}{remainder}'.format(
+            version = match.group(1),
+            prerelease = match.group(2),
+            remainder = match.group(3)
+            )
+        else:
+            version = tag_name
+
+    if version[0] == 'v':
+        version = version[1:]
+
+    try:
+        version = Version(version)
+    except ValueError:
+        version = Version(version, partial=True)
+
+    return version
 
 
 def locate_component_dir():
@@ -66,6 +97,56 @@ def locate_component_dir():
     if not os.path.exists(component_dir):
         os.makedirs(component_dir)
     return component_dir
+
+def split_components(package_str):
+    match_spec = re.compile(r'([A-z]+[A-z\d\-_]*)(~|>=|=|==|<=)(v{,1}[\d\.]+)')
+
+    match = match_spec.match(package_str)
+
+    if match:
+        name = match.group(1)
+        operator = match.group(2)
+        version = match.group(3)
+
+        if operator == '=':
+            # There is a mismatch between the way the node.js semver library
+            # and the python sematic_version specify the equals operator.
+            # we accept both, but must convert a single = to ==
+            operator = '=='
+
+        if operator == '~':
+            base_version = Version(version)
+
+            if base_version.patch: # ~1.1.1 is the same as >=1.1.1 and < 1.2.0
+                end_version = Version('{major}.{minor}.{patch}'.format(
+                    major=base_version.major,
+                    minor=base_version.minor +1,
+                    patch=0
+                ))
+            elif base_version.minor: # ~1.1 is the same as >= 1.1 and < 1.2
+                end_version = Version('{major}.{minor}.0'.format(
+                    major=base_version.major,
+                    minor=base_version.minor +1
+                ))
+            else: # ~1 is the same as >= 1.0.0 and < 2
+                end_version = Version('{major}.0.0'.format(
+                    major=base_version.major +1
+                ))
+
+            spec = Spec('>={start},<{end}'.format(start=base_version, end=end_version))
+        else:
+            spec = Spec(operator+version)
+        return name, spec
+
+
+    else:
+        log.error('Invalid package specification %s', package_str)
+        log.info(
+            'Package specifications must be of the form name~version where'
+            ' ~ is an operator and version is a version number according to '
+            'the semver spec (http://semver.org/)'
+            )
+
 
 class Progess(RemoteProgress):
     def update(self, op_code, cur_count, max_count=None, message=''):
@@ -114,67 +195,40 @@ class Package(object):
         self.version = version
         self.config = config
         self.cache = cache
-
-    def install(self):
-        # Is it already installed
-        installation_dir = os.path.join(self.config.component_dir, self.name)
-        if os.path.isdir(installation_dir):
-            installed_version = json.load(
-                open(
-                    os.path.join(installation_dir, 'bower.json')
-                )
-                )['version']
-            if installed_version == self.version:
-                log.info('Version %s of package %s is aready installed', self.version, self.name)
-                return
+        self.versions = []
+        self.version_tags = {}
 
         if self.cache:
             if self.is_cached():
-                # install from cache via either url or location
-                log.info('Installing version %s of %s from cache', self.version, self.name)
+                self.repo = self.get_repo_from_cache()
             else:
-                if self.cache.is_writeable:
-                    log.info('Loading %s into cache', self.name)
-                    # load into cache if cache is writable
-                    self.cache.load(self)
-                else:
-                    log.info('Installing version %s of %s without cache', self.version, self.name)
-                    dest = '/tmp/bower.py'
-                    self.fetch(dest=dest)
-                    self.repo = git.Repo(os.path.join(dest, self.name))
+                self.repo = self.load_package_into_cache()
 
-                    try:
-                        if self.version in self.repo.tags:
-                            tag = self.repo.tags[self.version]
-                        elif 'v' + self.version in self.repo.tags: # Thanks angular
-                            tag = self.repo.tags['v' + self.version]
-                        else:
-                            raise IndexError
+        if not self.repo:
+            dest = '/tmp/bower.py'
+            self.fetch(dest=dest)
+            self.repo = git.Repo(os.path.join(dest, self.name))
 
-                        archive_name = os.path.join(
-                            '/tmp/bower.py',
-                            '{0}.{1}.zip'.format(self.name, self.version)
-                        )
-
-                        archive = open(archive_name, 'wb')
-                        #archive = zipfile.ZipFile(archive_name, 'w') #TODO Later
-                        self.repo.archive(archive, format='zip', treeish=tag)
-                        archive.close()
-                    except IndexError:
-                        log.error('Version %s of package %s not found', self.version, self.name)
-                        log.debug(self.repo.tags)
-        else:
-            # Don't bother with caching just install it
-            log.info('Installing version %s of %s without cache', self.version, self.name)
-
-    def is_cached(self):
-        return False
+        self.get_versions_from_repo()
 
     def add_to_cache(self):
         log.info('Package {0} added to cache', self.name)
 
     def clear(self):
         log.info('Package {0} removed from cache')
+
+    def fetch(self, dest):
+        self.get_bower_metadata()
+
+        dest = os.path.join(dest, self.name)
+
+        if not os.path.isdir(dest):
+            self.repo = git.repo.Repo.clone_from(self.metadata['url'], dest, Progess())
+            log.info('Repo successfully cloned')
+    def get_best_version_from_repo(self, spec):
+        best_version = spec.select(self.versions)
+        return best_version
+
     def get_bower_metadata(self):
         # TODO caching - make sure we only hit bower once
         response = requests.get(API_URL + '/packages/' + self.name)
@@ -195,14 +249,66 @@ class Package(object):
         log.info('found repository {}'.format(result['url']))
 
 
-    def fetch(self, dest):
-        self.get_bower_metadata()
+    def get_repo_from_cache(self):
+        return None
 
-        dest = os.path.join(dest, self.name)
+    def get_versions_from_repo(self):
+        self.versions = []
+        self.version_tags = {}
 
-        if not os.path.isdir(dest):
-            self.repo = git.repo.Repo.clone_from(self.metadata['url'], dest, Progess())
-            log.info('Repo successfully cloned')
+        for tag in self.repo.tags:
+            try:
+                version = get_version_from_tag(tag.name)
+                self.versions.append(version)
+                self.version_tags[str(version)] = tag
+            except ValueError:
+                log.warn('Could not convert tag name (%s) to a version', tag.name)
+
+    def install(self):
+        # Is it already installed
+        installation_dir = os.path.join(self.config.component_dir, self.name)
+        if os.path.isdir(installation_dir):
+            installed_version = Version(json.load(
+                open(
+                    os.path.join(installation_dir, 'bower.json')
+                )
+                )['version'])
+            if installed_version == self.version:
+                log.info('Version %s of package %s is aready installed', self.version, self.name)
+                return
+
+        best = self.get_best_version_from_repo(self.version)
+        best_tag = self.version_tags[str(best)]
+
+        archive_name = os.path.join(
+            '/tmp/bower.py',
+            '{0}.{1}.zip'.format(self.name, str(best))
+        )
+
+        archive = open(archive_name, 'wb')
+        self.repo.archive(archive, format='zip', treeish=best_tag)
+        archive.close()
+
+        zf = zipfile.ZipFile(archive_name)
+        dest_path = os.path.join(self.config.component_dir, self.name)
+
+        if os.path.exists(dest_path):
+            shutil.rmtree(dest_path)
+
+        zf.extractall(dest_path)
+
+        #except IndexError:
+            #log.error('Version %s of package %s not found', str(self.version), self.name)
+            #log.debug(self.repo.tags)
+        #else:
+            ## Don't bother with caching just install it
+            #log.info('Installing version %s of %s without cache', self.version, self.name)
+
+    def is_cached(self):
+        return False
+
+    def load_package_into_cache(self):
+        return None
 
 class Project:
     def __init__(self, name):
@@ -406,19 +512,13 @@ def main():
         print(config)
 
     def cmd_install(args):
-        re_spec = re.compile('^([a-zA-Z]+[\\da-zA-z_\\-\\.]*)==(\\d+\\.\\d+\\.\\d+)$')
+        #re_spec = re.compile('^([a-zA-Z]+[\\da-zA-z_\\-\\.]*)~(\\d+\\.\\d+\\.\\d+)$')
+        print (args.name)
 
         for package in args.name:
-            match = re_spec.match(package)
-            if match:
-                name, version = match.groups()
-                package = Package(name, version, args.config, cache=args.cache)
-                package.install()
-            else:
-                log.error('Invalid package specification %s', package)
-                log.info(
-                    'Package specifications must be of the form name==version'
-                    ' where version is a full version number like 2.0.0')
+            name,version = split_components(package)
+            package = Package(name, version, args.config, cache=args.cache)
+            package.install()
 
 
     def get_parser():
